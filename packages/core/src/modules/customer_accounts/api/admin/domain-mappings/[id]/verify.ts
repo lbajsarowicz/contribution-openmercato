@@ -9,6 +9,7 @@ import {
   runCrudMutationGuardAfterSuccess,
 } from '@open-mercato/shared/lib/crud/mutation-guard'
 import { DomainMappingService } from '@open-mercato/core/modules/customer_accounts/services/domainMappingService'
+import { resolveDomainMappingOrganizationAccess } from '@open-mercato/core/modules/customer_accounts/lib/domainMappingOrganizationAccess'
 
 const FEATURE = 'customer_accounts.domain.manage'
 
@@ -30,7 +31,9 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   const { id } = await ctx.params
   const service = container.resolve('domainMappingService') as DomainMappingService
-  const record = await service.findById(id, { tenantId: auth.tenantId })
+  const { accessibleOrganizationIds } = await resolveDomainMappingOrganizationAccess(container, auth, req)
+  const scope = { tenantId: auth.tenantId, organizationIds: accessibleOrganizationIds }
+  const record = await service.findById(id, scope)
   if (!record) return NextResponse.json({ ok: false, error: 'Not found' }, { status: 404 })
 
   const guardResult = await validateCrudMutationGuard(container, {
@@ -49,10 +52,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
 
   let result
   try {
-    result = await service.verify(id)
-  } catch (err) {
+    result = await service.verify(id, scope)
+  } catch {
     return NextResponse.json(
-      { ok: false, error: err instanceof Error ? err.message : 'DNS verification failed' },
+      { ok: false, error: 'DNS verification failed' },
       { status: 500 },
     )
   }

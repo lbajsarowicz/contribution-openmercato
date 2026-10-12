@@ -15,8 +15,11 @@ import { registerDomainSchema } from '@open-mercato/core/modules/customer_accoun
 import {
   DomainMappingService,
   DomainMappingOrgScopeError,
+  DomainMappingReplaceNotFoundError,
+  DomainMappingReplaceScopeError,
   type ResolveResult,
 } from '@open-mercato/core/modules/customer_accounts/services/domainMappingService'
+import { resolveDomainMappingOrganizationAccess } from '@open-mercato/core/modules/customer_accounts/lib/domainMappingOrganizationAccess'
 import { DomainMapping } from '@open-mercato/core/modules/customer_accounts/data/entities'
 
 const FEATURE = 'customer_accounts.domain.manage'
@@ -57,9 +60,11 @@ function serializeRecord(record: DomainMapping) {
   }
 }
 
+const listQuerySchema = z.object({ organizationId: z.string().uuid().optional() })
+
 export async function GET(req: Request) {
   const auth = await getAuthFromRequest(req)
-  if (!auth) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
+  if (!auth || !auth.tenantId) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 })
 
   const container = await createRequestContainer()
   const rbac = container.resolve('rbacService') as RbacService
@@ -69,13 +74,28 @@ export async function GET(req: Request) {
   })
   if (!allowed) return NextResponse.json({ ok: false, error: 'Forbidden' }, { status: 403 })
 
-  const url = new URL(req.url)
-  const orgFilter = url.searchParams.get('organizationId')
+  const query = listQuerySchema.safeParse({
+    organizationId: new URL(req.url).searchParams.get('organizationId') ?? undefined,
+  })
+  if (!query.success) return NextResponse.json({ ok: false, error: 'Invalid request' }, { status: 400 })
+  const orgFilter = query.data.organizationId
+
+  const { accessibleOrganizationIds, listOrganizationIds } = await resolveDomainMappingOrganizationAccess(
+    container,
+    auth,
+    req,
+  )
+  const orgFilterDenied = orgFilter
+    ? accessibleOrganizationIds !== null && !accessibleOrganizationIds.includes(orgFilter)
+    : listOrganizationIds !== null && listOrganizationIds.length === 0
 
   const em = container.resolve('em') as EntityManager
   const where: Record<string, unknown> = { tenantId: auth.tenantId }
   if (orgFilter) where.organizationId = orgFilter
-  const records = await em.find(DomainMapping, where as never, { orderBy: { createdAt: 'desc' } })
+  else if (listOrganizationIds) where.organizationId = { $in: listOrganizationIds }
+  const records = orgFilterDenied
+    ? []
+    : await em.find(DomainMapping, where as never, { orderBy: { createdAt: 'desc' } })
 
   return NextResponse.json({
     ok: true,
@@ -108,6 +128,11 @@ export async function POST(req: Request) {
     )
   }
 
+  const { accessibleOrganizationIds } = await resolveDomainMappingOrganizationAccess(container, auth, req)
+  if (accessibleOrganizationIds && !accessibleOrganizationIds.includes(parsed.data.organizationId)) {
+    return NextResponse.json({ ok: false, error: 'Forbidden' }, { status: 403 })
+  }
+
   const guardResult = await validateCrudMutationGuard(container, {
     tenantId: auth.tenantId,
     organizationId: parsed.data.organizationId,
@@ -135,6 +160,7 @@ export async function POST(req: Request) {
       organizationId: parsed.data.organizationId,
       tenantId: auth.tenantId,
       replacesDomainId: parsed.data.replacesDomainId,
+      accessibleOrganizationIds,
     })
   } catch (err: unknown) {
     if (isUniqueViolation(err)) {
@@ -149,8 +175,16 @@ export async function POST(req: Request) {
         { status: 400 },
       )
     }
-    const message = err instanceof Error ? err.message : 'Failed to register domain'
-    return NextResponse.json({ ok: false, error: message }, { status: 500 })
+    if (err instanceof DomainMappingReplaceNotFoundError) {
+      return NextResponse.json({ ok: false, error: 'Not found' }, { status: 404 })
+    }
+    if (err instanceof DomainMappingReplaceScopeError) {
+      return NextResponse.json(
+        { ok: false, error: 'The domain to replace does not belong to this organization.' },
+        { status: 422 },
+      )
+    }
+    return NextResponse.json({ ok: false, error: 'Failed to register domain' }, { status: 500 })
   }
 
   if (guardResult?.ok && guardResult.shouldRunAfterSuccess) {
@@ -187,7 +221,12 @@ export async function DELETE(req: Request) {
   if (!id) return NextResponse.json({ ok: false, error: 'id is required' }, { status: 400 })
 
   const service = container.resolve('domainMappingService') as DomainMappingService
-  const existing = await service.findById(id, { tenantId: auth.tenantId })
+  const { accessibleOrganizationIds: organizationIds } = await resolveDomainMappingOrganizationAccess(
+    container,
+    auth,
+    req,
+  )
+  const existing = await service.findById(id, { tenantId: auth.tenantId, organizationIds })
   if (!existing) return NextResponse.json({ ok: false, error: 'Not found' }, { status: 404 })
 
   const guardResult = await validateCrudMutationGuard(container, {
@@ -204,7 +243,7 @@ export async function DELETE(req: Request) {
     return NextResponse.json(guardResult.body, { status: guardResult.status })
   }
 
-  await service.remove(id, { tenantId: auth.tenantId })
+  await service.remove(id, { tenantId: auth.tenantId, organizationIds })
 
   if (guardResult?.ok && guardResult.shouldRunAfterSuccess) {
     await runCrudMutationGuardAfterSuccess(container, {
@@ -248,7 +287,7 @@ export const openApi: OpenApiRouteDoc = {
   methods: {
     GET: {
       summary: 'List domain mappings',
-      description: 'Returns all custom-domain mappings for the current tenant, optionally filtered by organization.',
+      description: 'Returns custom-domain mappings of the organizations the caller can access, optionally filtered by organization.',
       responses: [
         {
           status: 200,
@@ -290,7 +329,9 @@ export const openApi: OpenApiRouteDoc = {
         { status: 400, description: 'Validation error', schema: errorSchema },
         { status: 401, description: 'Unauthorized', schema: errorSchema },
         { status: 403, description: 'Forbidden', schema: errorSchema },
+        { status: 404, description: 'Domain to replace not found', schema: errorSchema },
         { status: 409, description: 'Conflict', schema: errorSchema },
+        { status: 422, description: 'Replaced domain belongs to another organization', schema: errorSchema },
       ],
     },
     DELETE: {
@@ -301,6 +342,7 @@ export const openApi: OpenApiRouteDoc = {
         { status: 400, description: 'Bad request', schema: errorSchema },
         { status: 401, description: 'Unauthorized', schema: errorSchema },
         { status: 403, description: 'Forbidden', schema: errorSchema },
+        { status: 404, description: 'Not found', schema: errorSchema },
       ],
     },
   },

@@ -8,6 +8,7 @@ import {
 } from '@open-mercato/core/modules/customer_accounts/data/entities'
 import { Organization } from '@open-mercato/core/modules/directory/data/entities'
 import { emitCustomerAccountsEvent } from '@open-mercato/core/modules/customer_accounts/events'
+import { createLogger } from '@open-mercato/shared/lib/logger'
 import { normalizeHostname, tryNormalizeHostname } from '@open-mercato/core/modules/customer_accounts/lib/hostname'
 import { findOrganizationInTenant } from '@open-mercato/core/modules/customer_accounts/lib/organizationLookup'
 import { platformDomains } from '@open-mercato/core/modules/customer_accounts/lib/platformDomains'
@@ -19,6 +20,32 @@ export class DomainMappingOrgScopeError extends Error {
     this.name = 'DomainMappingOrgScopeError'
   }
 }
+
+export class DomainMappingReplaceScopeError extends Error {
+  constructor(replacesDomainId: string) {
+    super(`[internal] replacesDomainId ${replacesDomainId} does not belong to the target organization`)
+    this.name = 'DomainMappingReplaceScopeError'
+  }
+}
+
+export class DomainMappingReplaceNotFoundError extends Error {
+  constructor(replacesDomainId: string) {
+    super(`[internal] replacesDomainId ${replacesDomainId} was not found in the accessible organizations`)
+    this.name = 'DomainMappingReplaceNotFoundError'
+  }
+}
+
+export type DomainMappingScope = {
+  tenantId?: string
+  organizationIds?: readonly string[] | null
+}
+
+function applyScope(where: Record<string, unknown>, scope?: DomainMappingScope): void {
+  if (scope?.tenantId) where.tenantId = scope.tenantId
+  if (scope?.organizationIds) where.organizationId = { $in: [...scope.organizationIds] }
+}
+
+const logger = createLogger('customer_accounts').child({ component: 'domain-mapping' })
 
 const DOMAIN_ROUTING_TAG = 'domain_routing'
 const RESOLVE_KEY_PREFIX = 'domain_routing:resolve'
@@ -56,6 +83,7 @@ export type RegisterInput = {
   organizationId: string
   tenantId: string
   replacesDomainId?: string
+  accessibleOrganizationIds?: readonly string[] | null
 }
 
 type CacheService = {
@@ -152,9 +180,9 @@ export class DomainMappingService {
   // Read paths
   // -------------------------------------------------------------------------
 
-  async findById(id: string, scope?: { tenantId?: string }): Promise<DomainMapping | null> {
+  async findById(id: string, scope?: DomainMappingScope): Promise<DomainMapping | null> {
     const where: Record<string, unknown> = { id }
-    if (scope?.tenantId) where.tenantId = scope.tenantId
+    applyScope(where, scope)
     return this.em.findOne(DomainMapping, where as never)
   }
 
@@ -282,10 +310,16 @@ export class DomainMappingService {
 
     let replacesDomain: DomainMapping | null = null
     if (input.replacesDomainId) {
-      replacesDomain = await this.em.findOne(DomainMapping, {
-        id: input.replacesDomainId,
+      const replacesWhere: Record<string, unknown> = { id: input.replacesDomainId }
+      applyScope(replacesWhere, {
         tenantId: input.tenantId,
-      } as never)
+        organizationIds: input.accessibleOrganizationIds,
+      })
+      replacesDomain = await this.em.findOne(DomainMapping, replacesWhere as never)
+      if (!replacesDomain) throw new DomainMappingReplaceNotFoundError(input.replacesDomainId)
+      if (replacesDomain.organizationId !== input.organizationId) {
+        throw new DomainMappingReplaceScopeError(input.replacesDomainId)
+      }
     }
 
     const entity = this.em.create(DomainMapping, {
@@ -312,8 +346,8 @@ export class DomainMappingService {
     return entity
   }
 
-  async verify(id: string): Promise<VerifyResult> {
-    const entity = await this.em.findOne(DomainMapping, { id } as never)
+  async verify(id: string, scope?: DomainMappingScope): Promise<VerifyResult> {
+    const entity = await this.findById(id, scope)
     if (!entity) throw new Error(`DomainMapping ${id} not found`)
 
     const expectedCname = process.env.CUSTOM_DOMAIN_CNAME_TARGET ?? ''
@@ -382,7 +416,15 @@ export class DomainMappingService {
       const replaced = await this.em.findOne(DomainMapping, {
         id: (entity.replacesDomain as unknown as { id: string }).id,
       } as never)
-      if (replaced) {
+      if (replaced && (replaced.tenantId !== entity.tenantId || replaced.organizationId !== entity.organizationId)) {
+        logger.warn('Skipped removing a replaced domain mapping outside the replacement organization', {
+          domainMappingId: entity.id,
+          replacedDomainId: replaced.id,
+          organizationId: entity.organizationId,
+        })
+        entity.replacesDomain = null
+        await this.em.persist(entity).flush()
+      } else if (replaced) {
         const replacedHostname = replaced.hostname
         const replacedOrg = replaced.organizationId
         this.em.remove(replaced)
@@ -409,9 +451,9 @@ export class DomainMappingService {
     return entity
   }
 
-  async remove(id: string, scope?: { tenantId?: string }): Promise<void> {
+  async remove(id: string, scope?: DomainMappingScope): Promise<void> {
     const where: Record<string, unknown> = { id }
-    if (scope?.tenantId) where.tenantId = scope.tenantId
+    applyScope(where, scope)
     const entity = await this.em.findOne(DomainMapping, where as never)
     if (!entity) return
 
@@ -431,8 +473,8 @@ export class DomainMappingService {
     await this.invalidateCacheFor(hostname, organizationId)
   }
 
-  async healthCheck(id: string): Promise<DomainMapping> {
-    const entity = await this.em.findOne(DomainMapping, { id } as never)
+  async healthCheck(id: string, scope?: DomainMappingScope): Promise<DomainMapping> {
+    const entity = await this.findById(id, scope)
     if (!entity) throw new Error(`DomainMapping ${id} not found`)
     if (entity.status === 'active') return entity
     if (entity.status !== 'verified' && entity.status !== 'tls_failed') {

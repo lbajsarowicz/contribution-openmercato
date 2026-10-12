@@ -1,11 +1,24 @@
 /** @jest-environment node */
 import type { EntityManager } from '@mikro-orm/postgresql'
-import { DomainMappingService, DomainMappingOrgScopeError } from '@open-mercato/core/modules/customer_accounts/services/domainMappingService'
+import {
+  DomainMappingService,
+  DomainMappingOrgScopeError,
+  DomainMappingReplaceNotFoundError,
+  DomainMappingReplaceScopeError,
+} from '@open-mercato/core/modules/customer_accounts/services/domainMappingService'
 import {
   DomainMapping,
   type DomainStatus,
 } from '@open-mercato/core/modules/customer_accounts/data/entities'
 import { Organization } from '@open-mercato/core/modules/directory/data/entities'
+
+jest.mock('@open-mercato/shared/lib/logger', () => {
+  const mocked = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn(), child: jest.fn() }
+  mocked.child.mockImplementation(() => mocked)
+  return { createLogger: jest.fn(() => mocked) }
+})
+
+const mockLogger = jest.requireMock('@open-mercato/shared/lib/logger').createLogger('test') as { warn: jest.Mock }
 
 // Silence the "Event bus not available" console warnings emitted by
 // emitCustomerAccountsEvent in tests; the events themselves are fire-and-forget
@@ -233,6 +246,11 @@ beforeEach(() => {
 // register
 // ---------------------------------------------------------------------------
 
+const orgs = [
+  { id: ORG_A, slug: null, tenantId: TENANT_A },
+  { id: ORG_A2, slug: null, tenantId: TENANT_A },
+]
+
 describe('DomainMappingService.register', () => {
   it('creates a pending mapping for a valid hostname (happy path)', async () => {
     const em = createFakeEm({ orgs: [{ id: ORG_A, slug: null, tenantId: TENANT_A }] })
@@ -300,8 +318,7 @@ describe('DomainMappingService.register', () => {
     expect((stored as { id: string }).id).toBe(replacedRow.id)
   })
 
-  it('does NOT set the replacement pointer when replacesDomainId belongs to another tenant', async () => {
-    // Cross-tenant attack: tenant A trying to "replace" a record owned by tenant B
+  it('rejects replacesDomainId that belongs to another tenant as not found', async () => {
     const replacedRow = seedDomain({
       hostname: 'foreign.example.com',
       tenantId: TENANT_B,
@@ -311,16 +328,44 @@ describe('DomainMappingService.register', () => {
     const em = createFakeEm({ domains: [replacedRow], orgs: [{ id: ORG_A, slug: null, tenantId: TENANT_A }] })
     const service = new DomainMappingService(em as unknown as EntityManager)
 
-    const created = await service.register({
-      hostname: 'new.example.com',
-      tenantId: TENANT_A,
-      organizationId: ORG_A,
-      replacesDomainId: replacedRow.id,
-    })
+    await expect(
+      service.register({
+        hostname: 'new.example.com',
+        tenantId: TENANT_A,
+        organizationId: ORG_A,
+        replacesDomainId: replacedRow.id,
+      }),
+    ).rejects.toBeInstanceOf(DomainMappingReplaceNotFoundError)
+  })
 
-    // service.findOne is filtered by tenantId in register(), so the foreign
-    // record is invisible — replacement pointer must remain null.
-    expect((created as unknown as Row).replacesDomain).toBeNull()
+  it('rejects an unknown replacesDomainId as not found', async () => {
+    const em = createFakeEm({ orgs: [{ id: ORG_A, slug: null, tenantId: TENANT_A }] })
+    const service = new DomainMappingService(em as unknown as EntityManager)
+
+    await expect(
+      service.register({
+        hostname: 'new.example.com',
+        tenantId: TENANT_A,
+        organizationId: ORG_A,
+        replacesDomainId: 'does-not-exist',
+      }),
+    ).rejects.toBeInstanceOf(DomainMappingReplaceNotFoundError)
+  })
+
+  it('resolves replacesDomainId inside the accessible organizations only', async () => {
+    const replaced = seedDomain({ tenantId: TENANT_A, organizationId: ORG_A, status: 'active' })
+    const em = createFakeEm({ domains: [replaced], orgs })
+    const service = new DomainMappingService(em as unknown as EntityManager)
+
+    await expect(
+      service.register({
+        hostname: 'new.example.com',
+        tenantId: TENANT_A,
+        organizationId: ORG_A2,
+        replacesDomainId: replaced.id,
+        accessibleOrganizationIds: [ORG_A2],
+      }),
+    ).rejects.toBeInstanceOf(DomainMappingReplaceNotFoundError)
   })
 
   it('rejects registration when organizationId belongs to another tenant (org-scope regression #3839)', async () => {
@@ -824,5 +869,82 @@ describe('DomainMappingService.findByOrganization', () => {
     const service = new DomainMappingService(em as unknown as EntityManager)
     const result = await service.findByOrganization(ORG_A)
     expect(result).toEqual([])
+  })
+})
+
+describe('DomainMappingService organization scope', () => {
+  it('findById hides a row outside the organization scope', async () => {
+    const row = seedDomain({ tenantId: TENANT_A, organizationId: ORG_A })
+    const service = new DomainMappingService(createFakeEm({ domains: [row] }) as unknown as EntityManager)
+
+    expect(await service.findById(row.id, { tenantId: TENANT_A, organizationIds: [ORG_A2] })).toBeNull()
+    expect((await service.findById(row.id, { tenantId: TENANT_A, organizationIds: [ORG_A, ORG_A2] }))?.id).toBe(row.id)
+    expect((await service.findById(row.id, { tenantId: TENANT_A, organizationIds: null }))?.id).toBe(row.id)
+  })
+
+  it('remove leaves a row outside the organization scope untouched', async () => {
+    const row = seedDomain({ tenantId: TENANT_A, organizationId: ORG_A })
+    const em = createFakeEm({ domains: [row] })
+    const service = new DomainMappingService(em as unknown as EntityManager)
+
+    await service.remove(row.id, { tenantId: TENANT_A, organizationIds: [ORG_A2] })
+    expect(em.__store.has(row.id)).toBe(true)
+
+    await service.remove(row.id, { tenantId: TENANT_A, organizationIds: [ORG_A] })
+    expect(em.__store.has(row.id)).toBe(false)
+  })
+
+  it('an empty organization scope matches nothing', async () => {
+    const row = seedDomain({ tenantId: TENANT_A, organizationId: ORG_A })
+    const em = createFakeEm({ domains: [row] })
+    const service = new DomainMappingService(em as unknown as EntityManager)
+
+    expect(await service.findById(row.id, { tenantId: TENANT_A, organizationIds: [] })).toBeNull()
+    await service.remove(row.id, { tenantId: TENANT_A, organizationIds: [] })
+    expect(em.__store.has(row.id)).toBe(true)
+  })
+
+  it('verify and healthCheck refuse a row outside the organization scope', async () => {
+    const row = seedDomain({ tenantId: TENANT_A, organizationId: ORG_A, status: 'verified' })
+    const service = new DomainMappingService(createFakeEm({ domains: [row] }) as unknown as EntityManager)
+
+    await expect(service.verify(row.id, { tenantId: TENANT_A, organizationIds: [ORG_A2] })).rejects.toThrow(/not found/)
+    await expect(service.healthCheck(row.id, { tenantId: TENANT_A, organizationIds: [] })).rejects.toThrow(/not found/)
+  })
+
+  it('register rejects replacesDomainId owned by another organization of the tenant', async () => {
+    const replaced = seedDomain({ tenantId: TENANT_A, organizationId: ORG_A, status: 'active' })
+    const em = createFakeEm({ domains: [replaced], orgs })
+    const service = new DomainMappingService(em as unknown as EntityManager)
+
+    await expect(
+      service.register({
+        hostname: 'new.example.com',
+        tenantId: TENANT_A,
+        organizationId: ORG_A2,
+        replacesDomainId: replaced.id,
+      }),
+    ).rejects.toBeInstanceOf(DomainMappingReplaceScopeError)
+    expect(em.__store.size).toBe(1)
+  })
+
+  it('activate does not remove a replaced row that belongs to another organization', async () => {
+    const replaced = seedDomain({ tenantId: TENANT_A, organizationId: ORG_A, status: 'active' })
+    const replacement = seedDomain({
+      hostname: 'new.example.com',
+      tenantId: TENANT_A,
+      organizationId: ORG_A2,
+      status: 'verified',
+      replacesDomain: { id: replaced.id },
+    })
+    const em = createFakeEm({ domains: [replaced, replacement] })
+    const service = new DomainMappingService(em as unknown as EntityManager)
+
+    mockLogger.warn.mockClear()
+    await service.activate(replacement.id)
+
+    expect(em.__store.has(replaced.id)).toBe(true)
+    expect(em.__store.get(replacement.id)?.replacesDomain).toBeNull()
+    expect(mockLogger.warn).toHaveBeenCalledTimes(1)
   })
 })
